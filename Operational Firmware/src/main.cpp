@@ -12,24 +12,27 @@
 #include <Wire.h>
 #include <SPI.h>
 #include "SdFat.h"
-#include "TinyGPS++.h"
 #include "ICM_20948.h"
 #include "AS5600.h"
 #include "pins.h"
+#include "IWatchdog.h"
+#include "TinyGPS++.h"
+#include "SparkFun_u-blox_GNSS_Arduino_Library.h"
 
-// #define DEBUG_PRINT_ENABLE
-// #define WATCHDGOG_ENABLE //TODO Use
+//#define DEBUG_PRINT_ENABLE
+#define WATCHDOG_ENABLE
 // #define SHOW_DATA
+// #define SKIP_GPS_WAIT // For testing without waiting for GPS fix
 
 // ======================= Constants ======================= //
-const uint32_t DEBUG_BAUD = 9600;
-const uint32_t GPS_BAUD = 9600;
+const uint32_t DEBUG_BAUD = 115200;
+const uint32_t GPS_BAUD = 115200;
 const uint32_t SPI_SPEED = SD_SCK_MHZ(18);
-const uint32_t SAMPLE_INTERVAL = 100;      // ms
+const uint32_t SAMPLE_INTERVAL = 100; // ms
 const size_t LOG_BUFFER_LEN = 256;
-const float ANGLE_OFFSET_DEG = 12.0; // Offset for AS5600 angle in degrees
+const float ANGLE_OFFSET_DEG = 0.0; // Offset for AS5600 angle in degrees
 const size_t MAX_LOG_LINES = 30;
-const size_t WRITE_THRESHOLD = 20;
+const size_t WRITE_THRESHOLD = 10;
 #define GPS_TIMEOUT_MS 60000
 
 // ======================= Debug Macros ======================= //
@@ -42,13 +45,14 @@ const size_t WRITE_THRESHOLD = 20;
 #endif
 
 // ======================= Interfaces ======================= //
-HardwareSerial SerGPS(PA3, PA2);
 HardwareSerial SerDebug(PB11, PB10);
-TinyGPSPlus gps;
+HardwareSerial SerGPS(PA3, PA2);
 SdFat sd;
+TinyGPSPlus gps;
 File logFile;
 ICM_20948_I2C imu;
 AS5600 as5600;
+SFE_UBLOX_GNSS myGNSS;
 
 // ======================= Runtime State ======================= //
 /**
@@ -74,11 +78,129 @@ struct RuntimeStatus {
     STATE_ERROR          ///< Error state due to sensor, GPS, or SD failure
   } currentState = STATE_ACQUIRING_GPS;
 };
-
 RuntimeStatus runtime;
 
 char lineBuffer[MAX_LOG_LINES][LOG_BUFFER_LEN];
 size_t bufferedLines = 0;
+
+/**
+ * @brief Initialize and configure the u-blox GPS module.
+ * 
+ * This function performs a complete setup of the u-blox GNSS module, including:
+ * 
+ * - Verifying I2C communication with the module
+ * - Setting the dynamic model to AIRBORNE <4g> for high-altitude operation
+ * - Setting the UART1 baud rate to 115200
+ * - Reducing output rate to 1 Hz for power efficiency and sync with 1PPS
+ * - Disabling unnecessary NMEA messages for bandwidth and parser performance
+ * - Enabling only RMC (Recommended Minimum), ZDA (time), and GGA (position/altitude)
+ * - Configuring the TIMEPULSE output on pin 0 to generate a 100 ms pulse at 1 Hz
+ * - Saving all settings to battery-backed memory
+ * 
+ * This function is blocking and will halt execution permanently if the GPS module
+ * is not detected on the I2C bus. All configuration changes are made using the
+ * SFE_UBLOX_GNSS Arduino Library.
+ * 
+ * @note If GPS configuration fails, detailed debug messages are printed to SerDebug.
+ */
+bool setupGPS()
+{
+  if (!myGNSS.begin()) {
+    debugPrintln("GPS not detected. Check I2C wiring.");
+    return false;
+  }
+
+  debugPrintln("Configuring GPS...");
+
+  // Set dynamic model to AIRBORNE <4g>
+  if (!myGNSS.setDynamicModel(DYN_MODEL_AIRBORNE4g)) {
+    debugPrintln("Failed to set dynamic model");
+    return false;
+  }
+
+  // Set UART1 baud rate to 115200
+  myGNSS.setSerialRate(115200, COM_PORT_UART1); // No return value
+  debugPrintln("Set UART1 baud rate to 115200.");
+
+
+  // Set navigation rate to 1 Hz
+  if (!myGNSS.setNavigationFrequency(1))
+  {
+    debugPrintln("Failed to set navigation frequency");
+    return false;
+  }
+
+  // Disable all common NMEA messages
+  myGNSS.disableNMEAMessage(UBX_NMEA_GLL, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_GGA, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_GSA, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_GSV, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_VTG, COM_PORT_UART1);
+  myGNSS.disableNMEAMessage(UBX_NMEA_GNS, COM_PORT_UART1);
+
+  // Enable RMC and ZDA only
+  myGNSS.enableNMEAMessage(UBX_NMEA_RMC, COM_PORT_UART1);
+  myGNSS.enableNMEAMessage(UBX_NMEA_ZDA, COM_PORT_UART1);
+  myGNSS.enableNMEAMessage(UBX_NMEA_GGA, COM_PORT_UART1);
+
+  UBX_CFG_TP5_data_t timePulseSettings;
+  memset(&timePulseSettings, 0, sizeof(UBX_CFG_TP5_data_t)); // Clear struct
+
+  timePulseSettings.tpIdx = 0;                   // TIMEPULSE pin 0
+  timePulseSettings.version = 0x01;
+  timePulseSettings.flags.bits.active = 1;       // Enable output
+  timePulseSettings.flags.bits.lockedOtherSet = 1; // Align to top of second
+  timePulseSettings.flags.bits.isFreq = 1;       // Frequency mode
+  timePulseSettings.flags.bits.isLength = 1;     // Length is valid
+  //timePulseSettings.flags.bits.pulseDef = 0;     // Pulse is 'time high'
+  timePulseSettings.freqPeriod = 1;              // 1 Hz
+  timePulseSettings.freqPeriodLock = 1;
+  timePulseSettings.pulseLenRatio = 100000;      // 100ms = 100,000 ns
+  timePulseSettings.pulseLenRatioLock = 100000;
+
+  if (!myGNSS.setTimePulseParameters(&timePulseSettings))
+  {
+    debugPrintln("Failed to configure time pulse!");
+  }
+  else
+  {
+    debugPrintln("Time pulse configured.");
+  }
+
+  // Save settings
+  if (!myGNSS.saveConfiguration())
+  {
+    debugPrintln("Failed to save configuration!");
+    return false;
+  }
+  else
+  {
+    debugPrintln("GPS configuration saved.");
+  }
+
+  debugPrintln("Setup complete. GPS will output RMC/ZDA/GGA at 115200 baud over UART1.");
+  return true;
+}
+
+/**
+ * @brief Checks if the GPS has a valid fix and accurate time.
+ * 
+ * This function verifies that:
+ * - The GPS time is valid (gps.time.isValid() is true)
+ * - The GPS location is valid (gps.location.isValid() is true)
+ * 
+ * If both conditions are met, the GPS is considered "locked" and time is reliable.
+ * This avoids trusting GPS-estimated time from cold boot or almanac restore.
+ * 
+ * @return true if GPS has a valid fix and time; false otherwise.
+ */
+bool isGPSLocked() {
+  const unsigned long maxAge = 2000; // milliseconds
+  return gps.time.isValid() &&
+         gps.location.isValid() &&
+         gps.time.age() < maxAge &&
+         gps.location.age() < maxAge;
+}
 
 /**
  * @brief Set RGB LED state using PWM values.
@@ -94,18 +216,6 @@ void setLED(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 /**
- * @brief Update LED color to reflect current system state.
- */
-void updateLED() {
-  switch (runtime.currentState) {
-    case RuntimeStatus::STATE_ACQUIRING_GPS: setLED(0, 0, 255); break;
-    case RuntimeStatus::STATE_LOGGING:       setLED(0, 255, 0); break;
-    case RuntimeStatus::STATE_ERROR:         setLED(255, 0, 0); break;
-    default:                                 setLED(0, 0, 0); break;
-  }
-}
-
-/**
  * @brief GPS PPS interrupt handler.
  */
 void ppsISR() {
@@ -117,11 +227,13 @@ void ppsISR() {
  * @brief Poll a limited number of GPS characters and sync time if valid.
  */
 void pollGPS() {
-  const int maxChars = 10;
+  const int maxChars = 100;
   int count = 0;
   while (SerGPS.available() && count < maxChars) {
-    if (gps.encode(SerGPS.read())) {
-      if (gps.time.isValid() && runtime.ppsSeen) {
+    char c = SerGPS.read();
+    debugPrint(c); // Print GPS character for debugging
+    if (gps.encode(c)) {
+      if (isGPSLocked() && runtime.ppsSeen) {
         runtime.lastUTC = gps.time.value();
         runtime.gpsEpochMillis = runtime.ppsMillis;
         runtime.gpsLocked = true;
@@ -132,24 +244,23 @@ void pollGPS() {
     }
     count++;
   }
+// Reset lock if location or time becomes stale
+if (millis() - runtime.gpsLastValidMillis > 3000) {
+  runtime.gpsLocked = false;
+}
+
 }
 
 /**
- * @brief Generate a formatted timestamp string from GPS + PPS.
- *
- * @param buf Output buffer
- * @param len Length of output buffer
+ * @brief Update LED color to reflect current system state.
  */
-void getTimestamp(char* buf, size_t len) {
-  if (!runtime.gpsLocked || !gps.time.isValid() || !gps.date.isValid()) {
-    strncpy(buf, "0000-00-00 00:00:00.000", len);
-    return;
+void updateLED() {
+  switch (runtime.currentState) {
+    case RuntimeStatus::STATE_ACQUIRING_GPS: setLED(0, 0, 255); break;
+    case RuntimeStatus::STATE_LOGGING:       setLED(0, 255, 0); break;
+    case RuntimeStatus::STATE_ERROR:         setLED(255, 0, 0); break;
+    default:                                 setLED(0, 0, 0); break;
   }
-  uint32_t msSincePPS = millis() - runtime.gpsEpochMillis;
-  snprintf(buf, len, "%04d-%02d-%02d %02d:%02d:%02d.%03lu",
-           gps.date.year(), gps.date.month(), gps.date.day(),
-           gps.time.hour(), gps.time.minute(), gps.time.second(),
-           msSincePPS % 1000);
 }
 
 /**
@@ -209,12 +320,13 @@ bool openLogFile() {
     snprintf(filename, sizeof(filename), "OPLOG%03d.TXT", i);
     if (!sd.exists(filename)) {
       logFile = sd.open(filename, FILE_WRITE);
+      logFile.print("Timestamp,Millis,Lat,Lon,Elev,Angle,AccX,AccY,AccZ,GyroX,GyroY,GyroZ,MagX,MagY,MagZ");
       if (!logFile || !logFile.println("")) {
         runtime.logError = true;
         return false;
       }
       logFile.flush();
-      return true;
+      return true;    
     }
   }
   runtime.logError = true;
@@ -261,12 +373,27 @@ void addLogLine(const char* line) {
  * @brief Capture and store a sensor reading with timestamp.
  */
 void takeReading(uint32_t now) {
-  debugPrintln("Taking sensor readings");
+  char timestamp[24] = "00000000_000000.000";
+
+  if (gps.date.isValid() && gps.time.isValid()) {
+    snprintf(timestamp, sizeof(timestamp), "%04d%02d%02dT%02d%02d%02d.%03lu",
+            gps.date.year(),
+            gps.date.month(),
+            gps.date.day(),
+            gps.time.hour(),
+            gps.time.minute(),
+            gps.time.second(),
+            millis() - runtime.ppsMillis);
+  } else {
+    strcpy(timestamp, "00000000T000000.000");
+  }
+
+  float lat = gps.location.isValid() ? gps.location.lat() : -999.0;
+  float lon = gps.location.isValid() ? gps.location.lng() : -999.0;
+  float alt = gps.altitude.isValid() ? gps.altitude.meters() : -999.0;
+
   float angle, ax, ay, az, gx, gy, gz, mx, my, mz;
   bool sensorsOk = readSensors(angle, ax, ay, az, gx, gy, gz, mx, my, mz);
-
-  char timestamp[32];
-  getTimestamp(timestamp, sizeof(timestamp));
 
   // Convert float values to fixed-point (3 decimal places)
   int32_t iAngle = static_cast<int32_t>(angle * 1000.0f);
@@ -279,12 +406,18 @@ void takeReading(uint32_t now) {
   int32_t iMx    = static_cast<int32_t>(mx    * 1000.0f);
   int32_t iMy    = static_cast<int32_t>(my    * 1000.0f);
   int32_t iMz    = static_cast<int32_t>(mz    * 1000.0f);
+  int32_t iLat = static_cast<int32_t>(lat * 1e7);   // 7 decimal places
+  int32_t iLon = static_cast<int32_t>(lon * 1e7);
+  int32_t iAlt = static_cast<int32_t>(alt * 1000);  // meters × 1000
 
   // Format into CSV line (no float formatting required)
   char line[LOG_BUFFER_LEN];
-  snprintf(line, sizeof(line), "%s,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld",
-           timestamp, now, iAngle, iAx, iAy, iAz,
-           iGx, iGy, iGz, iMx, iMy, iMz);
+  snprintf(line, sizeof(line),
+         "%s,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld",
+         timestamp, now,
+         iLat, iLon, iAlt,
+         iAngle, iAx, iAy, iAz,
+         iGx, iGy, iGz, iMx, iMy, iMz);
 
   addLogLine(line);
 
@@ -292,8 +425,9 @@ void takeReading(uint32_t now) {
     writeBufferedLines();
   }
 
-  if (sensorsOk && runtime.gpsLocked) {
-    runtime.currentState = RuntimeStatus::STATE_LOGGING;
+  
+  if (!sensorsOk) {
+    runtime.currentState = RuntimeStatus::STATE_ERROR;
   }
 }
 
@@ -301,6 +435,8 @@ void takeReading(uint32_t now) {
  * @brief Arduino setup function.
  */
 void setup() {
+
+  // Cycle LED to indicate startup
   pinMode(PIN_LED_RED, OUTPUT);
   pinMode(PIN_LED_GREEN, OUTPUT);
   pinMode(PIN_LED_BLUE, OUTPUT);
@@ -311,12 +447,25 @@ void setup() {
   setLED(0, 0, 255);
   delay(1000);
   setLED(0, 0, 0);
+  delay(1000);
+  updateLED();
+
+  #ifdef WATCHDOG_ENABLE
+  IWatchdog.begin(26000000); //max 26208000
+  #endif
 
   SerDebug.begin(DEBUG_BAUD);
   SerGPS.begin(GPS_BAUD);
   Wire.begin();
+  Wire.setClock(400000); // Increase I2C clock speed to 400kHz
   SPI.begin();
 
+  if (!setupGPS())
+  {
+    runtime.currentState = RuntimeStatus::STATE_ERROR;
+  }
+
+  pinMode(PIN_GPS_PPS, INPUT); // PPS pin as input with pull-up
   attachInterrupt(digitalPinToInterrupt(PIN_GPS_PPS), ppsISR, RISING);
 
   debugPrintln("Initializing sensors...");
@@ -353,46 +502,54 @@ void setup() {
   }
   else debugPrintln("Log file opened successfully");
 
-  #ifdef WATCHDOG_ENABLE
-  IWDG->KR = 0xCCCC; // Start watchdog
-  IWDG->KR = 0x5555; // Enable write access
-  IWDG->PR = 6;      // Prescaler for ~1s timeout
-  IWDG->RLR = 312;   // Reload value
-  IWDG->KR = 0xAAAA; // Reload counter
+  if (runtime.currentState == RuntimeStatus::STATE_ERROR)
+  {
+    debugPrintln("Error state detected, stopping setup");
+    updateLED();
+    while(1){}
+  }
+
+  // Wait for GPS to lock
+  #ifndef SKIP_GPS_WAIT
+  debugPrintln("Waiting for GPS lock...");
+  while(!isGPSLocked()) {
+    pollGPS();
+    #ifdef WATCHDOG_ENABLE
+    IWatchdog.reload();
+    #endif
+  }
+  debugPrintln("GPS lock acquired");
+  runtime.currentState = RuntimeStatus::STATE_LOGGING;
   #endif
 }
 
 /**
  * @brief Main loop.
  */
-void loop() {
-  updateLED();
+void loop()
+{
+  uint32_t now = millis();
+
+  // Check if its time to read
+  if (now - runtime.lastSample >= SAMPLE_INTERVAL)
+  {
+    takeReading(now);
+    runtime.lastSample = now;
+  }
+
   pollGPS();
 
-  if (millis() - runtime.gpsLastValidMillis > GPS_TIMEOUT_MS)
-  {
-    debugPrintln("GPS timeout");
-    runtime.gpsError = true;
-    runtime.currentState = RuntimeStatus::STATE_ERROR;
-  }
+  // If we have lost fix, turn the state and LED back to BLUE but keep logging
+// Update system state based on GPS lock unless in error state
+if (runtime.currentState != RuntimeStatus::STATE_ERROR) {
+  runtime.currentState = runtime.gpsLocked ? 
+                         RuntimeStatus::STATE_LOGGING : 
+                         RuntimeStatus::STATE_ACQUIRING_GPS;
+}
 
-  if (runtime.currentState == RuntimeStatus::STATE_ERROR && runtime.gpsLocked && !runtime.logError) {
-    runtime.currentState = RuntimeStatus::STATE_LOGGING;
-  }
-
-  uint32_t now = millis();
-  if (now - runtime.lastSample >= SAMPLE_INTERVAL) {
-    debugPrintln("Time to read");
-    //runtime.lastSample += SAMPLE_INTERVAL;
-    runtime.lastSample = now; // Update lastSample to current time
-    takeReading(now);
-  }
-  else
-  {
-    debugPrintln("Not time to read yet");
-  }
 
   #ifdef WATCHDOG_ENABLE
-  IWDG->KR = 0xAAAA; // Pet the watchdog
+  IWatchdog.reload();
   #endif
+  updateLED();
 }
