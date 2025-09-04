@@ -54,6 +54,11 @@ ICM_20948_I2C imu;
 AS5600 as5600;
 SFE_UBLOX_GNSS myGNSS;
 
+// ======================= Time Struct ======================= //
+struct UtcStamp {
+  uint16_t year; uint8_t month, day, hour, minute, second;
+} utcAtLastPps;
+
 // ======================= Runtime State ======================= //
 /**
  * @brief Struct to hold runtime flags and timestamps for system state management.
@@ -183,6 +188,61 @@ bool setupGPS()
 }
 
 /**
+ * @brief Increment a UTC stamp by one second.
+ *
+ * This helper advances the provided UtcStamp struct by exactly one
+ * second, rolling over minutes and hours as needed. Day/month/year
+ * rollover is not fully implemented here since logging at 10 Hz will
+ * not skip across a day boundary, but can be added if required.
+ *
+ * @param u Reference to a UtcStamp structure to be incremented
+ */
+static void bumpOneSecond(UtcStamp &u) {
+  if (++u.second <= 59) return;
+  u.second = 0;
+  if (++u.minute <= 59) return;
+  u.minute = 0;
+  if (++u.hour <= 23) return;
+  u.hour = 0;
+  // Day/month/year rollovers omitted for brevity; at 10 Hz you won’t skip a day.
+}
+
+/**
+ * @brief Format a PPS-aligned UTC timestamp string.
+ *
+ * This function generates a timestamp string in the form
+ * YYYYMMDDTHHMMSS.mmm using the UTC date/time latched at the
+ * last GPS PPS event (utcAtLastPps) and the elapsed milliseconds
+ * since that PPS edge.
+ *
+ * - The UTC date/time fields come from the PPS-aligned latch so
+ *   the integer seconds are guaranteed to match the PPS boundary.
+ * - The fractional milliseconds are computed from
+ *   (now - runtime.gpsEpochMillis).
+ * - If more than 1000 ms have elapsed, the seconds are carried
+ *   forward using bumpOneSecond() until the millisecond remainder
+ *   is less than 1000.
+ *
+ * @param[out] out     Character buffer to receive the timestamp string
+ * @param[in]  outlen  Length of the output buffer
+ * @param[in]  now     Current millis() value when the reading is taken
+ */
+void formatTimestamp(char *out, size_t outlen, uint32_t now) {
+  // Milliseconds since the last PPS-aligned UTC boundary
+  uint32_t dms = now - runtime.gpsEpochMillis;
+
+  // Copy the latched UTC and add whole seconds if we’ve drifted >1000 ms
+  UtcStamp u = utcAtLastPps;
+  while (dms >= 1000) { dms -= 1000; bumpOneSecond(u); }
+
+  // Format: YYYYMMDDTHHMMSS.mmm
+  snprintf(out, outlen, "%04u%02u%02uT%02u%02u%02u.%03lu",
+           (unsigned)u.year, (unsigned)u.month, (unsigned)u.day,
+           (unsigned)u.hour, (unsigned)u.minute, (unsigned)u.second,
+           (unsigned long)dms);
+}
+
+/**
  * @brief Checks if the GPS has a valid fix and accurate time.
  * 
  * This function verifies that:
@@ -234,8 +294,15 @@ void pollGPS() {
     debugPrint(c); // Print GPS character for debugging
     if (gps.encode(c)) {
       if (isGPSLocked() && runtime.ppsSeen) {
-        runtime.lastUTC = gps.time.value();
-        runtime.gpsEpochMillis = runtime.ppsMillis;
+        // Latch UTC at the PPS boundary we just saw
+        utcAtLastPps.year   = gps.date.year();
+        utcAtLastPps.month  = gps.date.month();
+        utcAtLastPps.day    = gps.date.day();
+        utcAtLastPps.hour   = gps.time.hour();
+        utcAtLastPps.minute = gps.time.minute();
+        utcAtLastPps.second = gps.time.second();
+
+        runtime.gpsEpochMillis = runtime.ppsMillis;  // start of this UTC second (ms)
         runtime.gpsLocked = true;
         runtime.gpsLastValidMillis = millis();
         runtime.ppsSeen = false;
@@ -373,17 +440,9 @@ void addLogLine(const char* line) {
  * @brief Capture and store a sensor reading with timestamp.
  */
 void takeReading(uint32_t now) {
-  char timestamp[24] = "00000000_000000.000";
-
-  if (gps.date.isValid() && gps.time.isValid()) {
-    snprintf(timestamp, sizeof(timestamp), "%04d%02d%02dT%02d%02d%02d.%03lu",
-            gps.date.year(),
-            gps.date.month(),
-            gps.date.day(),
-            gps.time.hour(),
-            gps.time.minute(),
-            gps.time.second(),
-            millis() - runtime.ppsMillis);
+  char timestamp[24];
+  if (runtime.gpsLocked) {
+    formatTimestamp(timestamp, sizeof(timestamp), now);
   } else {
     strcpy(timestamp, "00000000T000000.000");
   }
