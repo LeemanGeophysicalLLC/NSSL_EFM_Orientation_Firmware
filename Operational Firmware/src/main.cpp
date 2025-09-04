@@ -481,6 +481,29 @@ void setup() {
   debugPrint("WHO_AM_I: 0x");
   debugPrintln(whoami);
 
+  // Set up IMU Ranges
+  // Set full scale ranges for both acc and gyr
+  ICM_20948_fss_t myFSS; // This uses a "Full Scale Settings" structure that can contain values for all configurable sensors
+
+  myFSS.a = gpm8; // (ICM_20948_ACCEL_CONFIG_FS_SEL_e)
+                  // gpm2
+                  // gpm4
+                  // gpm8
+                  // gpm16
+
+  myFSS.g = dps2000; // (ICM_20948_GYRO_CONFIG_1_FS_SEL_e)
+                    // dps250
+                    // dps500
+                    // dps1000
+                    // dps2000
+
+  imu.setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), myFSS);
+  if (imu.status != ICM_20948_Stat_Ok)
+  {
+    debugPrintln("IMU range setting failed");
+    runtime.currentState = RuntimeStatus::STATE_ERROR;
+  }
+
   if (!as5600.begin())
   {
     debugPrintln("Encoder initialization failed");
