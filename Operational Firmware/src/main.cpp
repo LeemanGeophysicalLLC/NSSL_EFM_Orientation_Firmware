@@ -413,7 +413,7 @@ void takeReading(uint32_t now) {
   // Format into CSV line (no float formatting required)
   char line[LOG_BUFFER_LEN];
   snprintf(line, sizeof(line),
-         "%s,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld",
+         "%s,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld,%ld",
          timestamp, now,
          iLat, iLon, iAlt,
          iAngle, iAx, iAy, iAz,
